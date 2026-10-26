@@ -221,8 +221,11 @@ pub fn spawn_car(
     // Visual child root: the model's origin is at ground level; the physics
     // origin is at the center of mass. Offset the visual down by the resting
     // center-of-mass height.
-    let com_rest =
-        preset.wheel_positions[0][1] + preset.suspension_rest_length * 0.8 + preset.wheel_radius;
+    // Wheel attach points sit above the body origin, so the ground is
+    // (rest length + radius - attach height) below it at static ride height.
+    let rest_len = preset.suspension_rest_length
+        - preset.mass_kg * 9.81 * 0.25 / preset.suspension_stiffness;
+    let com_rest = rest_len + preset.wheel_radius - preset.wheel_positions[0][1];
     let visual = commands
         .spawn((
             CarVisual,

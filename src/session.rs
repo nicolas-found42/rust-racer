@@ -5,6 +5,7 @@ use crate::assets::{self, CarHandles, WheelMeshNode};
 use crate::game_state::*;
 use crate::vehicle::{VehicleSimRes, COUNTDOWN_SECONDS};
 use avian3d::prelude::*;
+use bevy::camera::primitives::Aabb;
 use bevy::gizmos::prelude::Gizmos;
 use bevy::prelude::*;
 use core::score::RUN_DURATION_SECONDS;
@@ -19,7 +20,7 @@ impl Plugin for SessionPlugin {
             .add_systems(OnExit(AppState::Garage), exit_garage_preview)
             .add_systems(
                 Update,
-                water_reset.run_if(in_state(AppState::Driving)),
+                (water_reset, flip_reset).run_if(in_state(AppState::Driving)),
             )
             .add_systems(
                 Update,
@@ -113,6 +114,33 @@ fn water_reset(
     }
 }
 
+/// Recover a car lying on its roof or side: once it has been tipped past ~70°
+/// and nearly stopped for 1.5 s, request a checkpoint reset (same as R).
+fn flip_reset(
+    car: Query<&Rotation, With<PlayerCar>>,
+    runtime: Res<VehicleRuntime>,
+    time: Res<Time>,
+    mut reset: ResMut<crate::vehicle::ResetRequest>,
+    mut since: Local<Option<f64>>,
+) {
+    let Ok(rot) = car.single() else {
+        return;
+    };
+    let tipped = (rot.0 * Vec3::Y).y < 0.35 && runtime.telemetry.speed < 4.0;
+    let now = time.elapsed_secs_f64();
+    match (*since, tipped) {
+        (None, true) => *since = Some(now),
+        (Some(_), false) => *since = None,
+        (Some(t0), true) if now - t0 > 1.5 => {
+            reset.seq += 1;
+            reset.full = false;
+            *since = None;
+            info!("car flipped, auto-reset to checkpoint");
+        }
+        _ => {}
+    }
+}
+
 fn attach_pending_scenes_system(
     commands: Commands,
     handles: Res<CarHandles>,
@@ -149,7 +177,14 @@ pub struct WheelVisuals {
     /// Wheel base local positions (from the car preset).
     pub base_pos: [Vec3; 4],
     pub suspension_rest: f32,
+    /// Suspension length the visual rest pose assumes: the static-load
+    /// equilibrium, so the body sits at its true ride height.
+    pub rest_len: f32,
+    pub wheel_radius: f32,
     pub spin_accum: [f32; 4],
+    /// Lowest tire point in the visual root's space at the model's rest pose,
+    /// measured once the scene's meshes have bounds. `None` until then.
+    pub tire_bottom: Option<f32>,
 }
 
 /// Enter Driving: (re)spawn the selected car and reset session state.
@@ -190,16 +225,26 @@ fn start_session(
     };
 
     // Spawn at the skidpad checkpoint facing the pad center.
-    let spawn = Vec3::new(0.0, 1.0, 18.0);
+    // Spawn at ride height so the car doesn't drop and bounce on arrival.
+    let preset = selected.preset();
+    let rest_len = preset.suspension_rest_length
+        - preset.mass_kg * 9.81 * 0.25 / preset.suspension_stiffness;
+    let spawn = Vec3::new(
+        0.0,
+        rest_len + preset.wheel_radius - preset.wheel_positions[0][1] + 0.02,
+        18.0,
+    );
     let root = assets::spawn_car(&mut commands, &handles, &gltfs, selected, spawn, 0.0);
     debug!("Spawned {:?} at {:?}", selected, spawn);
 
     // Wheel animation geometry; the model's own wheel mesh nodes get tagged
     // by `process_car_scenes` once the scene spawns.
-    let preset = selected.preset();
     let visuals = WheelVisuals {
         base_pos: preset.wheel_positions.map(Vec3::from),
         suspension_rest: preset.suspension_rest_length,
+        // Static equilibrium of the spring under a quarter of the weight.
+        rest_len,
+        wheel_radius: preset.wheel_radius,
         ..default()
     };
     commands.insert_resource(visuals);
@@ -226,30 +271,93 @@ fn apply_live_tuning(
     }
 }
 
-/// Animate the model's own wheel mesh nodes: steering, suspension travel and
-/// axle spin, composed onto each node's at-rest base transform.
+/// Lowest world-space-independent point of every mesh under the tagged wheel
+/// nodes, expressed in the visual root's space.
+#[allow(clippy::type_complexity)]
+fn measure_tire_bottom(
+    root: &GlobalTransform,
+    nodes: &Query<(Entity, &WheelMeshNode)>,
+    children: &Query<&Children>,
+    meshes: &Query<(&Aabb, &GlobalTransform)>,
+) -> Option<f32> {
+    let to_root = root.affine().inverse();
+    let mut lowest = f32::MAX;
+    let mut found = 0;
+    for (entity, _) in nodes.iter() {
+        for e in std::iter::once(entity).chain(children.iter_descendants(entity)) {
+            let Ok((aabb, gt)) = meshes.get(e) else {
+                continue;
+            };
+            let (c, h) = (Vec3::from(aabb.center), Vec3::from(aabb.half_extents));
+            let m = to_root * gt.affine();
+            for i in 0..8 {
+                let corner = c + h
+                    * Vec3::new(
+                        if i & 1 == 0 { -1.0 } else { 1.0 },
+                        if i & 2 == 0 { -1.0 } else { 1.0 },
+                        if i & 4 == 0 { -1.0 } else { 1.0 },
+                    );
+                lowest = lowest.min(m.transform_point3(corner).y);
+            }
+            found += 1;
+        }
+    }
+    (found > 0).then_some(lowest)
+}
+
+/// Animate the model's own wheel mesh nodes so they sit exactly where the
+/// simulation says the wheels are: each wheel hangs from the body by its
+/// suspension length (tires touch the ground the ray found), steers with the
+/// front axle, and spins at the simulated wheel speed.
+#[allow(clippy::too_many_arguments, clippy::type_complexity)]
 fn update_wheel_visuals(
     runtime: Res<VehicleRuntime>,
     mut wheels: ResMut<WheelVisuals>,
-    mut nodes: Query<(&WheelMeshNode, &mut Transform)>,
+    mut nodes: Query<(&WheelMeshNode, &mut Transform), Without<CarVisual>>,
+    node_entities: Query<(Entity, &WheelMeshNode)>,
+    children: Query<&Children>,
+    meshes: Query<(&Aabb, &GlobalTransform)>,
+    mut visuals: Query<(&mut Transform, &GlobalTransform, &ChildOf), With<CarVisual>>,
+    player: Query<(), With<PlayerCar>>,
     time: Res<Time>,
 ) {
+    // Calibrate once: put the model's tire bottoms at the ground for the
+    // static ride height. Wheel nodes stay at their base pose until then.
+    if wheels.tire_bottom.is_none() {
+        for (mut vt, gt, parent) in visuals.iter_mut() {
+            if player.get(parent.parent()).is_err() {
+                continue;
+            }
+            if let Some(bottom) = measure_tire_bottom(gt, &node_entities, &children, &meshes) {
+                let attach_y = wheels.base_pos[0].y;
+                // Wheel attach points sit attach_y above the body origin, so the
+                // ground is rest_len + radius - attach_y below it.
+                vt.translation.y = -(wheels.rest_len + wheels.wheel_radius - attach_y) - bottom;
+                wheels.tire_bottom = Some(bottom);
+                debug!("tire calibration: bottom={bottom:.3} visual_y={:.3} attach_y={:.3} rest_len={:.3} r={:.3}", vt.translation.y, attach_y, wheels.rest_len, wheels.wheel_radius);
+            }
+        }
+        if wheels.tire_bottom.is_none() {
+            return;
+        }
+    }
+
     let dt = time.delta_secs();
     for (node, mut t) in nodes.iter_mut() {
         let i = node.index;
         let steer = if i < 2 { runtime.steer_visual } else { 0.0 };
-        let hang = (wheels.suspension_rest - runtime.suspension[i]).clamp(-0.12, 0.25);
-        let spin = {
-            let omega = runtime.wheels[i].angular_velocity;
-            wheels.spin_accum[i] = (wheels.spin_accum[i] + omega * dt) % std::f32::consts::TAU;
-            // Mirrored rim nodes (180° yaw base) have local X pointing the
-            // other way; flip so all wheels roll in the same world direction.
-            let axle_sign = (node.base.rotation * Vec3::X).x.signum();
-            wheels.spin_accum[i] * axle_sign
-        };
-        // Compressed suspension (length < rest) pulls the wheel up toward
-        // the body; hang is positive then.
-        t.translation = node.base.translation + Vec3::Y * hang;
+        // Longer suspension drops the wheel below its rest pose.
+        let drop = runtime.suspension[i] - wheels.rest_len;
+        let omega = runtime.wheels[i].angular_velocity;
+        // Cap the per-frame turn so very fast spin reads as fast forward
+        // rotation rather than aliasing into slow or reversed rotation.
+        let step = (omega * dt).clamp(-1.0, 1.0);
+        wheels.spin_accum[i] = (wheels.spin_accum[i] + step) % std::f32::consts::TAU;
+        // Rolling forward (-Z) turns the wheel about -X; mirrored rim nodes
+        // (180° yaw base) have local X pointing the other way, so flip.
+        let axle_sign = (node.base.rotation * Vec3::X).x.signum();
+        let spin = -wheels.spin_accum[i] * axle_sign;
+        t.translation = node.base.translation + Vec3::Y * (-drop);
         t.rotation = node.base.rotation
             * Quat::from_rotation_y(steer)
             * Quat::from_rotation_x(spin);
