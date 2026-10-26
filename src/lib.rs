@@ -46,6 +46,9 @@ pub fn run() {
                 .set(WindowPlugin {
                     primary_window: Some(Window {
                         title: "rust-racer — Coastal Drift Park".into(),
+                        // Demo/mute runs open behind other windows instead of
+                        // grabbing focus from whatever the user is doing.
+                        focused: !demo::quiet(),
                         resolution: {
                             let mut res = bevy::window::WindowResolution::new(3200, 1800);
                             res.set_scale_factor_override(Some(2.0)); // 1600x900 logical on the Retina dev Mac

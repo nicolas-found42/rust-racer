@@ -15,6 +15,13 @@ pub fn enabled() -> bool {
     std::env::var("RACER_DEMO").as_deref() == Ok("1")
 }
 
+/// True when the game should stay silent and keep out of the way of whoever
+/// is using the machine: the demo harness or an explicit `RACER_MUTE=1`.
+pub fn quiet() -> bool {
+    enabled() || std::env::var("RACER_DEMO").as_deref() == Ok("timed")
+        || std::env::var("RACER_MUTE").as_deref() == Ok("1")
+}
+
 #[derive(Resource, Default)]
 struct DemoState {
     last_cam_flip: f64,
@@ -29,6 +36,20 @@ fn demo_camera_cycle(
     mut camera: ResMut<CameraState>,
 ) {
     if *mode != AppState::Driving {
+        return;
+    }
+    // `RACER_CAM=chase|orbit|hood` pins one camera for focused screenshots.
+    let pinned = match std::env::var("RACER_CAM").as_deref() {
+        Ok("chase") => Some(CameraMode::Chase),
+        Ok("orbit") => Some(CameraMode::Orbit),
+        Ok("hood") => Some(CameraMode::Hood),
+        _ => None,
+    };
+    if let Some(m) = pinned {
+        if camera.mode != m {
+            camera.mode = m;
+            camera.snap_requested = true;
+        }
         return;
     }
     let now = time.elapsed_secs_f64();
@@ -96,6 +117,7 @@ fn demo_telemetry(
 /// the script demands throttle, request a checkpoint reset.
 fn demo_auto_reset(
     mut stuck_since: Local<Option<f64>>,
+    mut on_pad: Local<bool>,
     time: Res<Time>,
     runtime: Res<VehicleRuntime>,
     mode: Res<State<AppState>>,
@@ -109,10 +131,17 @@ fn demo_auto_reset(
     let wants_motion = runtime.telemetry.throttle > 0.5;
     let stuck = wants_motion && runtime.telemetry.speed < 0.3;
     let now = time.elapsed_secs_f64();
-    // Keep observation windows on the skidpad: reset when the car leaves the
-    // disc (demo only — the park itself stays open).
+    // Keep observation windows on the skidpad: once the car has reached the
+    // disc, reset it when it leaves (demo only — the park itself stays open).
+    // The checkpoint start is outside the disc, so containment must not apply
+    // before the car first arrives or it would reset every frame.
     let car = car_q.single().map(|p| p.0).unwrap_or_default();
-    if car.x * car.x + car.z * car.z > 42.0 * 42.0 {
+    let r2 = car.x * car.x + car.z * car.z;
+    if r2 < 36.0 * 36.0 {
+        *on_pad = true;
+    }
+    if *on_pad && r2 > 44.0 * 44.0 {
+        *on_pad = false;
         reset.seq += 1;
         reset.full = false;
         *stuck_since = None;

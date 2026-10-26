@@ -463,6 +463,9 @@ fn current_state(state: Option<&State<AppState>>) -> AppState {
 
 /// `(master, engine, tires, effects)` levels, clamped and defaulted.
 fn mix_levels(settings: Option<&GameSettings>) -> (f32, f32, f32, f32) {
+    if crate::demo::quiet() {
+        return (0.0, 0.0, 0.0, 0.0);
+    }
     match settings {
         Some(settings) => (
             settings.settings.volume_master.clamp(0.0, 1.0),

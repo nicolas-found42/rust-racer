@@ -109,6 +109,14 @@ instead. Useful for hands-off smoke testing; normal play ignores it.
 RACER_DEMO=1 cargo run --release
 ```
 
+Demo runs are muted and open behind other windows. For hands-off runs that
+must not interrupt whoever is using the machine, use
+`scripts/demo-quiet.sh [logfile]`: it sets `RACER_NO_ACTIVATE=1`, which the
+vendored `bevy_winit` (`vendor/bevy_winit`, wired in via `[patch.crates-io]`)
+turns into macOS accessory activation policy plus
+`activateIgnoringOtherApps(false)`. `RACER_MUTE=1` silences audio outside the
+demo, and `RACER_CAM=chase|orbit|hood` pins the demo camera.
+
 ## Asset provenance
 
 Cars are byte-identical GLB copies from the `carmodels` recovery corpus
