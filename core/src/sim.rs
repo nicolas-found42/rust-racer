@@ -321,7 +321,10 @@ impl VehicleSim {
                 let r_attach = attach - com;
                 let v_attach = body.velocity + body.angular_velocity.cross(r_attach);
                 let v_into_ground = v_attach.dot(-up);
-                let spring = p.suspension_stiffness * compression;
+                // Bump stop: travel ends progressively so hard roll/pitch can't
+                // slam the body down onto the ground.
+                let bump = (BUMP_STOP_START - len).max(0.0) * p.suspension_stiffness * 6.0;
+                let spring = p.suspension_stiffness * compression + bump;
                 let damper = p.suspension_damping * v_into_ground;
                 let n_force = (spring + damper).max(0.0).min(mass * gravity * 2.5);
                 loads[w] = n_force;
@@ -395,14 +398,16 @@ impl VehicleSim {
             self.wheels[w].steer_angle = if is_front(w) { self.steer_angle } else { 0.0 };
 
             if !grounded[w] {
-                // Free spin: driven wheels spin up; driven/others decay slowly.
-                if is_front(w) {
-                    self.wheels[w].angular_velocity *= (1.0 - 0.5 * dt).max(0.0);
+                // Airborne: a driven wheel spins up modestly with throttle,
+                // an undriven one coasts down; neither runs away.
+                let free_target = if is_front(w) {
+                    self.wheels[w].angular_velocity * 0.9
                 } else {
-                    let spin = self.wheels[w].angular_velocity
-                        + (rear_drive_each / self.config.wheel_inertia) * dt;
-                    self.wheels[w].angular_velocity = spin.min(280.0);
-                }
+                    (speed / self.config.preset.wheel_radius) * (1.0 + 0.5 * input.throttle)
+                };
+                let w_now = self.wheels[w].angular_velocity;
+                self.wheels[w].angular_velocity =
+                    w_now + (free_target - w_now) * (1.0 - (-dt / 0.3).exp());
                 self.wheels[w].slip_ratio = 0.0;
                 self.wheels[w].slip_angle = 0.0;
                 self.wheels[w].skid = 0.0;
@@ -489,17 +494,25 @@ impl VehicleSim {
                 f_long *= scale;
             }
 
-            // Wheel spin update: drive torque in, tire reaction + brakes out.
-            let reaction = f_long * wheel_radius;
-            let mut new_omega =
-                wheel_omega + ((drive_t - reaction) / self.config.wheel_inertia) * dt;
-            let brake_delta = (brake_f * wheel_radius / self.config.wheel_inertia) * dt;
-            let delta = new_omega - rolling_omega;
-            if delta.abs() <= brake_delta {
-                new_omega = rolling_omega;
-            } else {
-                new_omega -= brake_delta * delta.signum();
+            // Wheel spin follows the ground while the tire holds: the wheel
+            // turns at the rolling speed, spins up past it when drive thrust
+            // exceeds what the tire can transmit, and slows or locks when
+            // braking exceeds grip (handbrake locks the rears outright).
+            let capacity =
+                (long_max * (1.0 - (demand_lat * demand_lat).min(0.95)).sqrt()).max(1.0);
+            let thrust_excess = (drive_t.abs() / wheel_radius / capacity - 1.0).max(0.0);
+            let mut lock = (brake_f / capacity - 1.0).clamp(0.0, 1.0);
+            if input.handbrake && !is_front(w) {
+                lock = 1.0;
             }
+            let mut target = rolling_omega;
+            if thrust_excess > 0.0 {
+                let boost = (thrust_excess * 0.8).min(1.2);
+                target += drive_t.signum() * boost * rolling_omega.abs().max(25.0);
+            }
+            target *= 1.0 - lock;
+            let tau = if lock > 0.0 { 0.03 } else { 0.05 };
+            let new_omega = wheel_omega + (target - wheel_omega) * (1.0 - (-dt / tau).exp());
             self.wheels[w].angular_velocity = new_omega.clamp(-280.0, 280.0);
 
             // Skid intensity (FX/squeal): excess friction demand or locked/spun
@@ -607,7 +620,7 @@ impl VehicleSim {
         let ratio = self.gear_ratio(self.gear).abs().max(0.5);
         let speed_rpm =
             speed / p.wheel_radius / std::f32::consts::TAU * 60.0 * ratio;
-        if speed_rpm > p.redline_rpm * 0.95 {
+        if speed_rpm > p.redline_rpm * 0.72 {
             let next = self.gear + 1;
             if ((next - 1) as usize) < p.gear_ratios.len() {
                 self.gear = next;
@@ -634,6 +647,9 @@ fn approach(current: f32, target: f32, max_delta: f32) -> f32 {
     }
 }
 
+/// Suspension length (m) below which the bump stop starts to resist.
+const BUMP_STOP_START: f32 = 0.12;
+
 /// Chassis planar speed.
 pub fn planar_speed(v: Vec3) -> f32 {
     Vec3::new(v.x, 0.0, v.z).length()
@@ -649,6 +665,7 @@ fn smoothstep(edge0: f32, edge1: f32, x: f32) -> f32 {
 mod tests {
     use super::*;
     use crate::tuning::CarPreset;
+    use bevy_math::vec3;
 
     /// Flat infinite ground at y=0.
     struct FlatGround;
@@ -787,6 +804,62 @@ mod tests {
             rolling
         );
         assert!(sim.wheels[WHEEL_RL].skid > 0.0 || sim.wheels[WHEEL_RR].skid > 0.0);
+    }
+
+    #[test]
+    fn coasting_wheels_roll_at_ground_speed() {
+        // No throttle: every grounded wheel (driven or not) turns at v / r.
+        let mut sim = make_sim();
+        let mut body = rest_body();
+        body.velocity = vec3(0.0, 0.0, -15.0);
+        for _ in 0..60 {
+            sim.step(&body, &DriverInput::default(), &FlatGround, FIXED_DT);
+        }
+        let rolling = 15.0 / sim.config.preset.wheel_radius;
+        for w in &sim.wheels {
+            assert!(
+                (w.angular_velocity - rolling).abs() < rolling * 0.05,
+                "omega {} vs rolling {}",
+                w.angular_velocity,
+                rolling
+            );
+        }
+    }
+
+    #[test]
+    fn handbrake_locks_rear_wheels_only() {
+        let mut sim = make_sim();
+        let mut body = rest_body();
+        body.velocity = vec3(0.0, 0.0, -15.0);
+        let input = DriverInput {
+            handbrake: true,
+            ..Default::default()
+        };
+        for _ in 0..30 {
+            sim.step(&body, &input, &FlatGround, FIXED_DT);
+        }
+        assert!(sim.wheels[WHEEL_RL].angular_velocity.abs() < 2.0);
+        assert!(sim.wheels[WHEEL_RR].angular_velocity.abs() < 2.0);
+        assert!(sim.wheels[WHEEL_FL].angular_velocity > 20.0);
+    }
+
+    #[test]
+    fn gearbox_upshifts_as_speed_builds() {
+        let mut sim = make_sim();
+        let mut body = rest_body();
+        let input = DriverInput {
+            throttle: 1.0,
+            ..Default::default()
+        };
+        let mut top_gear = 1;
+        for _ in 0..(FIXED_DT.recip() as usize * 12) {
+            let (f, _) = sim.step(&body, &input, &FlatGround, FIXED_DT);
+            body.velocity += (f.force + Vec3::Y * -9.81 * body.mass) / body.mass * FIXED_DT;
+            body.position += body.velocity * FIXED_DT;
+            body.position.y = rest_body().position.y;
+            top_gear = top_gear.max(sim.gear);
+        }
+        assert!(top_gear >= 3, "only reached gear {top_gear}");
     }
 
     #[test]
