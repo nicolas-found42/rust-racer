@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = ["core", "."]
+
+[workspace.package]
+edition = "2021"
+version = "1.0.0"
+
+[package]
+name = "rust-racer"
+version.workspace = true
+edition.workspace = true
+default-run = "rust-racer"
+
+[dependencies]
+core = { path = "core" }
+bevy = { version = "0.17", features = ["wav"] }
+avian3d = "0.4"
+bevy_math = "0.17"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 4
+
+[profile.dev]
+opt-level = 1
+
+[profile.dev.package."*"]
+opt-level = 3

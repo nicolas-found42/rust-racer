@@ -1,0 +1,58 @@
+{
+  "schema": "rust-racer car asset manifest v1",
+  "source": "Read-only asset source: /Users/nicolas/Documents/github/carmodels (recovered car model corpus). This game ships copied GLBs and never reads the sibling repository at runtime.",
+  "notice": "Vehicle models are recovered from the named commercial games and are the property of their respective rights holders; used here as local research/showcase assets. Handling presets, physics values, audio and all gameplay tuning are game-specific creations of rust-racer and do not reproduce original vehicle performance data.",
+  "cars": [
+    {
+      "file": "assets/cars/rx7_1995.glb",
+      "sha256": "76e5586bcb7e860e61eb0a0e606701ed3eb3671a9b6794d96524c285d8e4998c",
+      "code": "MCLA_VP_MZD_RX7_95",
+      "catalogName": "1995 RX7",
+      "game": "midnight-club-los-angeles",
+      "gameLabel": "Midnight Club: Los Angeles",
+      "sourcePath": "public/midnight-club-los-angeles/previews/vp_mzd_rx7_95.glb",
+      "initialSource": "public/midnight-club-los-angeles/previews/vp_mzd_rx7_95.glb",
+      "sizeBytes": 4017056,
+      "adjustments": [
+        "Imported via Bevy glTF loader; scene normalized (meters, -Z forward, ground contact) through a visual child transform.",
+        "Game importer clamps metallic factors to 0 for painted/trim surfaces, keeps baseColor textures, hides MC3 drop-shadow mesh.",
+        "Independent rim+tire wheel nodes are re-parented as steerable/spinning wheel visuals.",
+        "No geometry edits; original GLB bytes copied verbatim (hash above)."
+      ]
+    },
+    {
+      "file": "assets/cars/fairladyz_350z_2004.glb",
+      "sha256": "8a1b7ba44d38815c6c491d3caf9e3b139dbf51c9d74d4c9546b2ee3164d48383",
+      "code": "MC3_VP_350Z_04",
+      "catalogName": "vp_350z_04",
+      "game": "midnight-club-3-remix",
+      "gameLabel": "Midnight Club 3 Remix",
+      "sourcePath": "games/midnight-club-3-remix/recovered-models/vp_350z_04.glb",
+      "initialSource": null,
+      "sizeBytes": 3658156,
+      "adjustments": [
+        "Imported via Bevy glTF loader; scene normalized (meters, -Z forward, ground contact) through a visual child transform.",
+        "Game importer clamps metallic factors to 0 for painted/trim surfaces, keeps baseColor textures, hides MC3 drop-shadow mesh.",
+        "Independent rim+tire wheel nodes are re-parented as steerable/spinning wheel visuals.",
+        "No geometry edits; original GLB bytes copied verbatim (hash above)."
+      ]
+    },
+    {
+      "file": "assets/cars/skyline_r34_1999.glb",
+      "sha256": "ebcc0eadb63e32d0d81e67766a1b07a322d1e935ed072782f3688d8407dc3eae",
+      "code": "MCLA_VP_NSN_SKYLINE_99",
+      "catalogName": "1999 SKYLINE GT-R V-SPEC",
+      "game": "midnight-club-los-angeles",
+      "gameLabel": "Midnight Club: Los Angeles",
+      "sourcePath": "public/midnight-club-los-angeles/previews/vp_nsn_skyline_99.glb",
+      "initialSource": "public/midnight-club-los-angeles/previews/vp_nsn_skyline_99.glb",
+      "sizeBytes": 4478056,
+      "adjustments": [
+        "Imported via Bevy glTF loader; scene normalized (meters, -Z forward, ground contact) through a visual child transform.",
+        "Game importer clamps metallic factors to 0 for painted/trim surfaces, keeps baseColor textures, hides MC3 drop-shadow mesh.",
+        "Independent rim+tire wheel nodes are re-parented as steerable/spinning wheel visuals.",
+        "No geometry edits; original GLB bytes copied verbatim (hash above)."
+      ]
+    }
+  ]
+}

@@ -1,0 +1,6 @@
+target/
+.DS_Store
+saved/
+
+# Ripped from commercial games (Midnight Club); not redistributable
+assets/cars/*.glb
