@@ -63,6 +63,7 @@ fn update_camera(
     mut rig: ResMut<CameraRigState>,
     mut q_camera: Query<(&mut Transform, &mut Projection), With<MainCamera>>,
     car: Query<(&Position, &Rotation, &LinearVelocity), With<PlayerCar>>,
+    car_colliders: Query<Entity, With<crate::assets::CarCollider>>,
     runtime: Res<VehicleRuntime>,
     spatial: SpatialQuery,
     world: Option<Res<WorldBuilt>>,
@@ -88,8 +89,10 @@ fn update_camera(
         CameraMode::Hood => {
             let forward = car_rot * Vec3::NEG_Z;
             let up = car_rot * Vec3::Y;
-            desired_pos = car_pos + up * 0.62 + forward * 0.42;
-            desired_look = car_pos + up * 0.75 + forward * 12.0;
+            // Over the bonnet, just ahead of the windscreen base: the body
+            // origin is mid-cabin, so anything nearer sits inside the roof.
+            desired_pos = car_pos + up * 0.66 + forward * 1.15;
+            desired_look = car_pos + up * 0.6 + forward * 12.0;
             // Rigid: no smoothing.
             rig.pos = desired_pos;
             rig.look = desired_look;
@@ -98,8 +101,13 @@ fn update_camera(
             rig.orbit_angle += dt * 0.25;
             let r = 8.5;
             let center = car_pos + Vec3::Y * 0.8;
-            desired_pos =
+            let mut orbit_pos =
                 center + Vec3::new(rig.orbit_angle.cos() * r, 3.0, rig.orbit_angle.sin() * r);
+            if let Some(world) = world.as_ref() {
+                let ground_h = world.geo.height(orbit_pos.x, orbit_pos.z);
+                orbit_pos.y = orbit_pos.y.max(ground_h + 0.8);
+            }
+            desired_pos = orbit_pos;
             desired_look = center;
             let t = (dt * 4.0).min(1.0);
             rig.pos = rig.pos.lerp(desired_pos, t);
@@ -149,9 +157,13 @@ fn update_camera(
                     bevy::math::Dir3::new(to_cam / dist).unwrap(),
                     dist,
                     true,
-                    &SpatialQueryFilter::from_excluded_entities([runtime
-                        .car_entity
-                        .unwrap_or(Entity::PLACEHOLDER)]),
+                    &SpatialQueryFilter::from_excluded_entities(
+                        // The car's box collider is a child entity; leaving it
+                        // in puts the ray's start inside it when the car tilts.
+                        car_colliders
+                            .iter()
+                            .chain(runtime.car_entity),
+                    ),
                 ) {
                     pos_target = target + (to_cam / dist) * (hit.distance - 0.35).max(0.6);
                 }

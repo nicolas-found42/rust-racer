@@ -528,6 +528,21 @@ impl WorldGeo {
         (best_d, best_h)
     }
 
+    /// Surface at a world position: the skidpad disc and road corridors are
+    /// asphalt; everything else is grass (less grip, more rolling drag).
+    pub fn surface(&self, x: f32, z: f32) -> core::sim::Surface {
+        let d_pad = ((x - PAD_CENTER.x).powi(2) + (z - PAD_CENTER.z).powi(2)).sqrt();
+        if d_pad < PAD_RADIUS {
+            return core::sim::Surface::ASPHALT;
+        }
+        let (road_d, _) = self.road_distance_height(x, z);
+        if road_d < ROAD_HALF_WIDTH + 0.3 {
+            core::sim::Surface::ASPHALT
+        } else {
+            core::sim::Surface { grip: 0.55, rolling: 3.5 }
+        }
+    }
+
     /// Master height function used by terrain mesh + collision + tests.
     /// Road corridors conform to road height; elsewhere terrain noise.
     pub fn height(&self, x: f32, z: f32) -> f32 {

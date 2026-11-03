@@ -77,6 +77,7 @@ struct AvianGround<'w, 's> {
     query: &'w SpatialQuery<'w, 's>,
     car: Entity,
     collider: Entity,
+    geo: Option<&'w crate::world::geo::WorldGeo>,
 }
 
 impl GroundQuery for AvianGround<'_, '_> {
@@ -92,6 +93,12 @@ impl GroundQuery for AvianGround<'_, '_> {
             normal: hit.normal,
             distance: hit.distance as f32,
         })
+    }
+
+    fn surface_at(&self, point: Vec3) -> core::sim::Surface {
+        self.geo
+            .map(|g| g.surface(point.x, point.z))
+            .unwrap_or(core::sim::Surface::ASPHALT)
     }
 }
 
@@ -120,6 +127,7 @@ fn vehicle_control(
     colliders: Query<Entity, With<crate::assets::CarCollider>>,
     input: Res<DriverInputRes>,
     spatial: SpatialQuery,
+    world: Option<Res<crate::world::build::WorldBuilt>>,
     mut runtime: ResMut<VehicleRuntime>,
     score: Res<ScoreRuntime>,
     mut step: ResMut<StepControl>,
@@ -150,6 +158,7 @@ fn vehicle_control(
         query: &spatial,
         car: entity,
         collider: collider_entity,
+        geo: world.as_deref().map(|w| &*w.geo),
     };
     let dt = core::FIXED_DT;
     let started = std::time::Instant::now();
