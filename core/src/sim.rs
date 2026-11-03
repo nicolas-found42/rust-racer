@@ -30,10 +30,27 @@ pub struct RayHit {
     pub distance: f32,
 }
 
+/// What a wheel is rolling on. Grip scales the tire's peak force; rolling
+/// scales rolling resistance.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Surface {
+    pub grip: f32,
+    pub rolling: f32,
+}
+
+impl Surface {
+    pub const ASPHALT: Surface = Surface { grip: 1.0, rolling: 1.0 };
+}
+
 /// Ground/world query the controller needs. Implemented over avian's
 /// spatial query in the game layer, and analytically in tests.
 pub trait GroundQuery {
     fn cast_ray(&self, origin: Vec3, direction: Vec3, max_distance: f32) -> Option<RayHit>;
+
+    /// Surface under a wheel contact point; asphalt unless the host knows better.
+    fn surface_at(&self, _point: Vec3) -> Surface {
+        Surface::ASPHALT
+    }
 }
 
 /// Raw body state mirrored from the engine before each controller tick.
@@ -144,6 +161,9 @@ pub struct VehicleSim {
     gear: i8,
     /// Seconds remaining in an automatic shift.
     shift_timer: f32,
+    /// Keep the current gear (no automatic shifting); for tests and a future
+    /// manual gearbox.
+    gear_hold: bool,
     rpm: f32,
     /// Rear grip recovery envelope 0..1 (1 = full grip restored).
     handbrake_recovery: f32,
@@ -162,6 +182,7 @@ impl VehicleSim {
             steer_angle: 0.0,
             gear: 1,
             shift_timer: 0.0,
+            gear_hold: false,
             rpm: idle,
             handbrake_recovery: 1.0,
             throttle_smooth: 0.0,
@@ -204,10 +225,18 @@ impl VehicleSim {
         }
     }
 
-    /// Simple torque curve: ramp to 25%, plateau to 82%, falloff to redline.
-    fn torque_at_rpm(&self, rpm: f32) -> f32 {
+    /// Peak crank torque (N·m). The preset's `engine_torque` is the wheel
+    /// torque available in first gear, so divide the first-gear ratio out.
+    fn peak_crank_torque(&self) -> f32 {
         let p = &self.config.preset;
-        let redline = p.redline_rpm;
+        let first = p.gear_ratios.first().copied().unwrap_or(1.0) * p.final_drive;
+        p.engine_torque / first.max(0.5) * self.config.tuning.engine_torque
+    }
+
+    /// Crank torque at full throttle: ramp to 25%, plateau to 82%, falloff to
+    /// redline, hard cut at the limiter.
+    fn torque_at_rpm(&self, rpm: f32) -> f32 {
+        let redline = self.config.preset.redline_rpm;
         if rpm >= redline {
             return 0.0;
         }
@@ -219,7 +248,7 @@ impl VehicleSim {
         } else {
             1.0 - (frac - 0.82) / 0.18 * 0.85
         };
-        p.engine_torque * shape.max(0.0) * self.config.tuning.engine_torque
+        self.peak_crank_torque() * shape.max(0.0)
     }
 
     /// Reverse/forward selection from input, called by the host before `step`.
@@ -279,11 +308,35 @@ impl VehicleSim {
 
         let yaw_rate = body.angular_velocity.dot(up);
 
-        // ---- Steering: speed-sensitive, rate-limited ----
+        // ---- Steering: speed-sensitive, rate-limited, with slip-angle assist ----
         let steer_speed_scale =
             1.0 - (1.0 - p.min_steer_fraction) * (speed / p.steer_reduction_speed).clamp(0.0, 1.0);
         let max_steer = crate::rad(p.max_steer_deg) * steer_speed_scale;
-        let target_steer = input.steer.clamp(-1.0, 1.0) * max_steer;
+        let mut target_steer = input.steer.clamp(-1.0, 1.0) * max_steer;
+        let assist = self.config.tuning.assist.clamp(0.0, 2.0);
+        if assist > 0.01 {
+            // Countersteer like a driver (VDrift-style steering assist): point
+            // the wheels along the car's velocity (zero body slip), within a
+            // window of front-tire peak slip. Using the centre-of-mass
+            // velocity rather than the front axle's matters: the axle's own
+            // velocity includes the yaw swing, and matching it would remove
+            // the front slip that damps the rotation.
+            let right = rotation * Vec3::X;
+            let v_long_c = body.velocity.dot(forward);
+            let v_lat_c = body.velocity.dot(right);
+            if v_long_c > 2.0 {
+                // Left-positive, matching the steer angle convention.
+                let neutral = (-v_lat_c).atan2(v_long_c);
+                let half = ALPHA_PEAK * (ASSIST_WINDOW_MAX - ASSIST_WINDOW_STEP * assist);
+                let assisted = target_steer
+                    .clamp(neutral - half, neutral + half)
+                    .clamp(-crate::rad(p.max_steer_deg) * DRIFT_LOCK_BONUS, crate::rad(p.max_steer_deg) * DRIFT_LOCK_BONUS);
+                // Only in a slide: ordinary cornering keeps full driver control.
+                let slide = smoothstep(ASSIST_SLIDE_ON, ASSIST_SLIDE_FULL, (v_lat_c / v_long_c).atan().abs());
+                let blend = smoothstep(3.0, 8.0, v_long_c) * slide;
+                target_steer += (assisted - target_steer) * blend;
+            }
+        }
         let steer_rate = 5.0 * crate::rad(p.max_steer_deg);
         self.steer_angle = approach(self.steer_angle, target_steer, steer_rate * dt);
 
@@ -309,6 +362,7 @@ impl VehicleSim {
         let mut grounded = [false; WHEEL_COUNT];
         let mut normals = [Vec3::Y; WHEEL_COUNT];
         let mut contacts = [Vec3::ZERO; WHEEL_COUNT];
+        let mut surfaces = [Surface::ASPHALT; WHEEL_COUNT];
 
         let ray_max = p.suspension_rest_length + p.wheel_radius;
         for w in 0..WHEEL_COUNT {
@@ -332,6 +386,7 @@ impl VehicleSim {
                 grounded_count += 1;
                 normals[w] = h.normal.normalize();
                 contacts[w] = h.point;
+                surfaces[w] = ground.surface_at(h.point);
                 self.wheels[w].suspension_length = len;
                 self.wheels[w].load = n_force;
                 self.wheels[w].grounded = true;
@@ -374,13 +429,47 @@ impl VehicleSim {
         }
         if speed > 0.01 {
             let dir = v_planar / speed;
-            total_force += dir * -(p.drag * speed * speed + p.rolling_resistance * speed);
+            let rolling_scale = surfaces.iter().map(|s| s.rolling).sum::<f32>() / WHEEL_COUNT as f32;
+            total_force += dir * -(p.drag * speed * speed + p.rolling_resistance * rolling_scale * speed);
         }
 
-        // ---- Per-wheel drive/brake/tire forces ----
+        // ---- Drivetrain: crank -> gearbox -> rear limited-slip differential ----
         let wheel_radius = p.wheel_radius;
-        let drive_torque_total = self.drive_torque(input);
-        let rear_drive_each = drive_torque_total * 0.5;
+        let gear_ratio = self.gear_ratio(self.gear);
+        let shifting = self.shift_timer > 0.0;
+        // Pulling the handbrake dumps the clutch (as a drifter does), so the
+        // brake can lock the rears instead of fighting the engine.
+        let connected = gear_ratio != 0.0 && !shifting && !input.handbrake;
+        let drive_total = if connected {
+            // Traction assist (VDrift TCS, tuned for drifting): wheelspin is
+            // allowed up to a point, then power is cut as slip climbs.
+            let rear_slip = 0.5
+                * (self.wheels[WHEEL_RL].slip_ratio.abs() + self.wheels[WHEEL_RR].slip_ratio.abs());
+            let rear_angle = 0.5
+                * (self.wheels[WHEEL_RL].slip_angle.abs() + self.wheels[WHEEL_RR].slip_angle.abs());
+            let tcs_strength = self.config.tuning.assist.clamp(0.0, 1.0);
+            // Only while sliding sideways: launches and burnouts keep full power.
+            let sliding = smoothstep(0.12, 0.3, rear_angle);
+            let tcs = 1.0
+                - smoothstep(TCS_SLIP_ON, TCS_SLIP_FULL, rear_slip) * sliding * TCS_MAX_CUT * tcs_strength;
+            let torque = self.engine_torque(input);
+            (if torque > 0.0 { torque * tcs } else { torque }) * gear_ratio * DRIVETRAIN_EFFICIENCY
+        } else {
+            self.engine_torque(input);
+            0.0
+        };
+        let rear_drive = lsd_split(
+            drive_total,
+            self.wheels[WHEEL_RL].angular_velocity,
+            self.wheels[WHEEL_RR].angular_velocity,
+        );
+        // Reflected engine inertia slows wheelspin-up in low gears.
+        let driven_inertia = self.config.wheel_inertia
+            + if connected {
+                0.5 * ENGINE_INERTIA * gear_ratio * gear_ratio
+            } else {
+                0.0
+            };
         let rear_grip_scale = self.config.tuning.rear_grip;
 
         let hb_cut = if input.handbrake {
@@ -403,7 +492,7 @@ impl VehicleSim {
                 let free_target = if is_front(w) {
                     self.wheels[w].angular_velocity * 0.9
                 } else {
-                    (speed / self.config.preset.wheel_radius) * (1.0 + 0.5 * input.throttle)
+                    (speed / p.wheel_radius) * (1.0 + 0.5 * input.throttle)
                 };
                 let w_now = self.wheels[w].angular_velocity;
                 self.wheels[w].angular_velocity =
@@ -430,33 +519,7 @@ impl VehicleSim {
             let v_long = v_contact.dot(wheel_fwd);
             let v_lat = v_contact.dot(wheel_right);
 
-            // ---- Longitudinal: wheel dynamics + slip ratio ----
-            let drive_t = if is_front(w) { 0.0 } else { rear_drive_each };
-            let brake_f = if is_front(w) {
-                input.brake * p.brake_force * (1.0 - p.rear_brake_bias)
-            } else {
-                input.brake * p.brake_force * p.rear_brake_bias + handbrake_brake_each
-            };
-            let wheel_omega = self.wheels[w].angular_velocity;
-            let rolling_omega = v_long / wheel_radius;
-            let slip_ratio = if v_long.abs() > 0.5 {
-                (wheel_omega * wheel_radius - v_long) / v_long.abs()
-            } else {
-                (wheel_omega * wheel_radius - v_long) / 2.0
-            };
-            self.wheels[w].slip_ratio = slip_ratio;
-
-            let mut f_long =
-                drive_t / wheel_radius - brake_f * (wheel_omega * wheel_radius - v_long).signum();
-            // Static stop: brakes at crawl speed convert to direct damping.
-            if (input.brake > 0.0 || input.handbrake) && v_long.abs() < 0.4 {
-                f_long = (-v_long * mass * 6.0 / WHEEL_COUNT as f32)
-                    .clamp(-brake_f * 2.0, brake_f * 2.0);
-            }
-
-            // ---- Lateral: slip-angle force with progressive saturation ----
-            let slip_angle = v_lat.atan2(v_long.abs() + 1.5);
-            self.wheels[w].slip_angle = slip_angle;
+            // ---- Tire: Pacejka-style combined slip ----
             let base_grip = if is_front(w) {
                 p.tire_grip_front
             } else {
@@ -465,11 +528,22 @@ impl VehicleSim {
             let load_sens = (loads[w] / (mass * gravity * 0.25))
                 .powf(-p.load_sensitivity)
                 .clamp(0.5, 1.6);
-            let grip = base_grip * load_sens;
-            let f_lat_max = (grip * loads[w]).max(0.0);
-            // Saturates near 8 degrees slip for progressive breakaway.
-            let stiffness = f_lat_max / crate::rad(8.0);
-            let mut f_lat = -stiffness * slip_angle;
+            let peak = (base_grip * load_sens * surfaces[w].grip * loads[w]).max(0.0);
+
+            let wheel_omega = self.wheels[w].angular_velocity;
+            let v_ref = v_long.abs().max(1.5);
+            let kappa = ((wheel_omega * wheel_radius - v_long) / v_ref).clamp(-3.0, 3.0);
+            let slip_angle = v_lat.atan2(v_long.abs() + 1.5);
+            self.wheels[w].slip_angle = slip_angle;
+            let sx = kappa / KAPPA_PEAK;
+            let sy = slip_angle / ALPHA_PEAK;
+            let s_norm = (sx * sx + sy * sy).sqrt();
+            let force = peak * tire_curve(s_norm);
+            let (mut f_long, mut f_lat) = if s_norm > 1e-4 {
+                (force * sx / s_norm, -force * sy / s_norm)
+            } else {
+                (0.0, 0.0)
+            };
 
             // Relaxation in time prevents lateral force oscillation.
             let relax = 1.0 - (-dt / 0.035).exp();
@@ -478,58 +552,64 @@ impl VehicleSim {
 
             // Low-speed static friction: direct lateral damping below 1.5 m/s.
             if speed < 1.5 {
-                let damp = (-v_lat * mass * 6.0 / WHEEL_COUNT as f32).clamp(-f_lat_max, f_lat_max);
+                let damp = (-v_lat * mass * 6.0 / WHEEL_COUNT as f32).clamp(-peak, peak);
                 f_lat = damp;
                 self.lateral_memory[w] = f_lat;
             }
 
-            // ---- Friction circle (combined demand) ----
-            let long_max = f_lat_max * 1.05;
-            let demand_lat = f_lat.abs() / f_lat_max.max(1.0);
-            let demand_long = f_long.abs() / long_max.max(1.0);
-            let total_demand = (demand_lat * demand_lat + demand_long * demand_long).sqrt();
-            if total_demand > 1.0 {
-                let scale = 1.0 / total_demand;
-                f_lat *= scale;
-                f_long *= scale;
+            // ---- Brakes (ABS on the foot brake above 4 m/s; handbrake locks) ----
+            let foot_f = if is_front(w) {
+                input.brake * p.brake_force * (1.0 - p.rear_brake_bias)
+            } else {
+                input.brake * p.brake_force * p.rear_brake_bias
+            };
+            let abs_scale = if foot_f > 0.0 && speed > 4.0 && self.wheels[w].slip_ratio < 0.0 {
+                (1.0 - (self.wheels[w].slip_ratio.abs() / KAPPA_PEAK - 1.0) * 1.5).clamp(0.0, 1.0)
+            } else {
+                1.0
+            };
+            let brake_t = (foot_f * abs_scale
+                + if is_front(w) { 0.0 } else { handbrake_brake_each })
+                * wheel_radius;
+
+            // Static stop: brakes at crawl speed convert to direct damping.
+            let stopping = (input.brake > 0.0 || input.handbrake) && v_long.abs() < 0.4;
+            if stopping {
+                f_long = (-v_long * mass * 6.0 / WHEEL_COUNT as f32)
+                    .clamp(-brake_t * 2.0 / wheel_radius, brake_t * 2.0 / wheel_radius);
             }
 
-            // Wheel spin follows the ground while the tire holds: the wheel
-            // turns at the rolling speed, spins up past it when drive thrust
-            // exceeds what the tire can transmit, and slows or locks when
-            // braking exceeds grip (handbrake locks the rears outright).
-            let capacity =
-                (long_max * (1.0 - (demand_lat * demand_lat).min(0.95)).sqrt()).max(1.0);
-            let thrust_excess = (drive_t.abs() / wheel_radius / capacity - 1.0).max(0.0);
-            let mut lock = (brake_f / capacity - 1.0).clamp(0.0, 1.0);
-            if input.handbrake && !is_front(w) {
-                lock = 1.0;
+            // ---- Wheel spin: drive + brake - tire reaction, solved implicitly
+            // against the tire's slip stiffness so it stays stable at low speed.
+            let drive_t = if is_front(w) { 0.0 } else { rear_drive[w - WHEEL_RL] };
+            let inertia = if is_front(w) { self.config.wheel_inertia } else { driven_inertia };
+            let slope = if s_norm > 1e-4 {
+                (peak * tire_curve_slope(s_norm) / KAPPA_PEAK * (sx / s_norm).powi(2)).max(0.0)
+            } else {
+                peak * TIRE_C * TIRE_B / KAPPA_PEAK
+            };
+            let brake_dir = (wheel_omega * 4.0).tanh();
+            let net = drive_t - f_long * wheel_radius - brake_dir * brake_t;
+            let denom = 1.0 + dt * wheel_radius * slope * (wheel_radius / v_ref) / inertia;
+            let mut new_omega = wheel_omega + dt * net / inertia / denom;
+            if brake_t > 0.0 && new_omega * wheel_omega < 0.0 {
+                new_omega = 0.0; // brakes can stop a wheel, not reverse it
             }
-            let mut target = rolling_omega;
-            if thrust_excess > 0.0 {
-                let boost = (thrust_excess * 0.8).min(1.2);
-                target += drive_t.signum() * boost * rolling_omega.abs().max(25.0);
+            if stopping {
+                new_omega = 0.0;
             }
-            target *= 1.0 - lock;
-            let tau = if lock > 0.0 { 0.03 } else { 0.05 };
-            let new_omega = wheel_omega + (target - wheel_omega) * (1.0 - (-dt / tau).exp());
             self.wheels[w].angular_velocity = new_omega.clamp(-280.0, 280.0);
 
-            // Skid intensity (FX/squeal): excess friction demand or locked/spun
-            // wheel. Fades out below ~4 m/s so low-speed numerical slip (crawl
-            // damping, stationary spin-up) does not trigger smoke or squeal.
+            // Skid intensity (FX/squeal): sliding past peak slip. Fades out below
+            // ~4 m/s so low-speed numerical slip does not trigger smoke or squeal.
             let skid_speed_gate = smoothstep(1.0, 4.0, speed);
             let skid = if loads[w] > 10.0 {
-                let demand_skid = (total_demand - 0.92).clamp(0.0, 1.0);
-                let slip_skid = slip_ratio.abs().clamp(0.0, 1.0) * 0.7;
-                demand_skid.max(slip_skid) * skid_speed_gate
+                (s_norm - 0.9).clamp(0.0, 1.0) * skid_speed_gate
             } else {
                 0.0
             };
             self.wheels[w].skid = skid;
-            // Report bounded slip; raw ratios during stationary spin-up are
-            // numerical, not physical.
-            self.wheels[w].slip_ratio = slip_ratio.clamp(-3.0, 3.0);
+            self.wheels[w].slip_ratio = kappa;
             self.wheels[w].lateral_force = f_lat.abs();
             self.wheels[w].longitudinal_force = f_long.abs();
 
@@ -538,16 +618,17 @@ impl VehicleSim {
             total_torque += r_contact.cross(f);
         }
 
-        // ---- Bounded countersteer/heading assist + yaw damping ----
+        // ---- Yaw damping + drift stability assist ----
+        // The assist nudges yaw toward a rate that holds the current slide
+        // (bounded, scaled by the assist setting, off at assist 0 so that
+        // setting gives the pure simulation).
         let assist_strength = (p.base_assist * self.config.tuning.assist).clamp(0.0, 1.0);
         if speed > 3.0 && grounded_count >= 2 {
-            // Nudge yaw toward the velocity heading (countersteer-like),
-            // strictly bounded by the assist strength.
             let desired_yaw_rate = drift_angle * 1.6;
             let yaw_err = desired_yaw_rate - yaw_rate;
-            let cap = 3600.0 * assist_strength;
-            total_torque += up * (yaw_err * assist_strength * 4200.0).clamp(-cap, cap);
-            total_torque += up * (-yaw_rate * 420.0 * (0.4 + 0.6 * assist_strength));
+            let cap = ASSIST_YAW_CAP * assist_strength;
+            total_torque += up * (yaw_err * assist_strength * ASSIST_YAW_GAIN).clamp(-cap, cap);
+            total_torque += up * (-yaw_rate * 300.0);
         } else {
             // Airborne/slow: mild angular damping keeps landings composed.
             total_torque += body.angular_velocity * -200.0;
@@ -559,17 +640,15 @@ impl VehicleSim {
             total_force = total_force.normalize() * max_force;
         }
 
-        // ---- RPM from vehicle speed + launch flare ----
-        // Wheel-spin-derived rpm pegs the redline whenever the wheels break
-        // loose, so derive from vehicle speed and let the throttle flare at
-        // low speed (clutch slip) instead.
-        let ratio = self.gear_ratio(self.gear).abs().max(0.5);
-        let rolling_rpm =
-            speed / p.wheel_radius / std::f32::consts::TAU * 60.0 * ratio;
+        // ---- Engine rpm: driveshaft speed (wheelspin shows on the tach) plus a
+        // clutch-slip launch flare at low speed ----
+        let drive_omega =
+            0.5 * (self.wheels[WHEEL_RL].angular_velocity + self.wheels[WHEEL_RR].angular_velocity).abs();
+        let shaft_rpm = drive_omega * self.gear_ratio(self.gear).abs() * 60.0 / std::f32::consts::TAU;
         let launch_flare = self.throttle_smooth * 2600.0 * (1.0 - (speed / 8.0).min(1.0));
-        let engine_rpm = rolling_rpm.max(p.idle_rpm) + launch_flare;
-        self.rpm += (engine_rpm.clamp(p.idle_rpm, p.redline_rpm) - self.rpm)
-            * (1.0 - (-dt / 0.12).exp());
+        let engine_rpm = shaft_rpm.max(p.idle_rpm) + launch_flare;
+        self.rpm += (engine_rpm.clamp(p.idle_rpm, p.redline_rpm * 1.02) - self.rpm)
+            * (1.0 - (-dt / 0.08).exp());
         self.rpm = self.rpm.max(p.idle_rpm);
 
         let telemetry = Telemetry {
@@ -594,21 +673,25 @@ impl VehicleSim {
         )
     }
 
-    fn drive_torque(&mut self, input: &DriverInput) -> f32 {
+    /// Net crank torque: throttle-scaled torque curve minus engine braking
+    /// (which fades in as the throttle lifts).
+    fn engine_torque(&mut self, input: &DriverInput) -> f32 {
         self.throttle_smooth += (input.throttle.clamp(0.0, 1.0) - self.throttle_smooth)
             * (1.0 - (-FIXED_DT / 0.09).exp());
-        if self.gear == -1 {
-            return -self.torque_at_rpm(self.rpm) * self.throttle_smooth;
-        }
-        if self.gear == 0 {
-            return 0.0;
-        }
-        self.torque_at_rpm(self.rpm) * self.throttle_smooth
+        let p = &self.config.preset;
+        let braking = ENGINE_BRAKING
+            * self.peak_crank_torque()
+            * (self.rpm / p.redline_rpm).clamp(0.0, 1.2)
+            * (1.0 - self.throttle_smooth);
+        self.torque_at_rpm(self.rpm) * self.throttle_smooth - braking
     }
 
     fn update_gears(&mut self, dt: f32, speed: f32) {
         let p = self.config.preset.clone();
         self.shift_timer = (self.shift_timer - dt).max(0.0);
+        if self.gear_hold {
+            return;
+        }
         if self.shift_timer > 0.0 || self.gear <= 0 {
             if self.gear == 0 {
                 self.gear = 1;
@@ -620,21 +703,88 @@ impl VehicleSim {
         let ratio = self.gear_ratio(self.gear).abs().max(0.5);
         let speed_rpm =
             speed / p.wheel_radius / std::f32::consts::TAU * 60.0 * ratio;
-        if speed_rpm > p.redline_rpm * 0.72 {
+        // Shift points follow the throttle like a real auto box: early when
+        // cruising, held near redline under load so power is there to drift.
+        let load = self.throttle_smooth;
+        let up_rpm = p.redline_rpm * (0.70 + 0.20 * load);
+        let down_rpm = p.redline_rpm * (0.30 + 0.15 * load);
+        if speed_rpm > up_rpm {
             let next = self.gear + 1;
             if ((next - 1) as usize) < p.gear_ratios.len() {
                 self.gear = next;
                 self.shift_timer = 0.22;
             }
-        } else if self.gear > 1 && speed_rpm < p.redline_rpm * 0.32 {
+        } else if self.gear > 1 && speed_rpm < down_rpm {
             let lower_ratio = self.gear_ratio(self.gear - 1).abs();
             let projected = speed_rpm * (lower_ratio / ratio);
-            if projected < p.redline_rpm * 0.9 {
+            if projected < p.redline_rpm * 0.88 {
                 self.gear -= 1;
                 self.shift_timer = 0.18;
             }
         }
     }
+}
+
+/// Slip ratio at which a tire reaches peak longitudinal force.
+const KAPPA_PEAK: f32 = 0.12;
+/// Slip angle (rad) at which a tire reaches peak lateral force (~8 deg).
+const ALPHA_PEAK: f32 = 0.14;
+/// Magic-formula shape: peak at normalised slip 1, falling to ~89% of peak
+/// when fully sliding, so a drift loses some grip instead of plateauing.
+const TIRE_B: f32 = 2.65;
+const TIRE_C: f32 = 1.3;
+
+/// Normalised combined-slip friction curve (VDrift-style Pacejka magic
+/// formula, E = 0): 0 at no slip, 1 at `s = 1`, ~0.89 as `s -> inf`.
+fn tire_curve(s: f32) -> f32 {
+    (TIRE_C * (TIRE_B * s).atan()).sin()
+}
+
+/// d(tire_curve)/ds, used for the implicit wheel-speed update.
+fn tire_curve_slope(s: f32) -> f32 {
+    let bs = TIRE_B * s;
+    (TIRE_C * bs.atan()).cos() * TIRE_C * TIRE_B / (1.0 + bs * bs)
+}
+
+/// Fraction of crank torque that reaches the wheels.
+const DRIVETRAIN_EFFICIENCY: f32 = 0.9;
+/// Engine + flywheel + clutch inertia (kg·m²), reflected through the gears.
+const ENGINE_INERTIA: f32 = 0.18;
+/// Engine braking torque at redline, as a fraction of peak crank torque.
+const ENGINE_BRAKING: f32 = 0.16;
+/// Rear limited-slip differential: viscous coupling (N·m per rad/s),
+/// preload (N·m), and torque-sensitive lock fraction.
+const DIFF_ANTI_SLIP: f32 = 600.0;
+const DIFF_PRELOAD: f32 = 120.0;
+const DIFF_POWER_LOCK: f32 = 0.45;
+/// Steering assist window half-width (in front-tire peak slip angles) at
+/// assist 0..2: tires are kept near their peak slip, which also countersteers.
+const ASSIST_WINDOW_MAX: f32 = 2.0;
+const ASSIST_WINDOW_STEP: f32 = 0.5;
+/// Drift stability torque: gain (N·m per rad/s of yaw error) and cap (N·m)
+/// at full assist strength.
+const ASSIST_YAW_GAIN: f32 = 12000.0;
+const ASSIST_YAW_CAP: f32 = 12000.0;
+/// Traction assist: rear slip ratio where power starts to be cut, where the
+/// cut is complete, and the largest fraction of power it removes.
+const TCS_SLIP_ON: f32 = 0.25;
+const TCS_SLIP_FULL: f32 = 0.7;
+const TCS_MAX_CUT: f32 = 0.8;
+/// Body slip angle (rad) where the steering assist starts to engage and
+/// where it is fully on (~6 and ~12 degrees).
+const ASSIST_SLIDE_ON: f32 = 0.10;
+const ASSIST_SLIDE_FULL: f32 = 0.21;
+/// Extra steering lock the assist may use to countersteer a slide, like a
+/// drift car's modified knuckles.
+const DRIFT_LOCK_BONUS: f32 = 1.35;
+
+/// Split drive torque between the rear wheels (left, right). A viscous +
+/// torque-sensitive limited-slip coupling moves torque from the faster wheel
+/// to the slower one, so a lightly loaded wheel can't run away.
+fn lsd_split(total: f32, omega_left: f32, omega_right: f32) -> [f32; 2] {
+    let lock_limit = DIFF_PRELOAD + DIFF_POWER_LOCK * total.abs();
+    let couple = (DIFF_ANTI_SLIP * (omega_left - omega_right)).clamp(-lock_limit, lock_limit);
+    [total * 0.5 - couple, total * 0.5 + couple]
 }
 
 /// Move `current` toward `target` by at most `max_delta`.
@@ -838,8 +988,14 @@ mod tests {
         for _ in 0..30 {
             sim.step(&body, &input, &FlatGround, FIXED_DT);
         }
-        assert!(sim.wheels[WHEEL_RL].angular_velocity.abs() < 2.0);
-        assert!(sim.wheels[WHEEL_RR].angular_velocity.abs() < 2.0);
+        assert!(
+            sim.wheels[WHEEL_RL].angular_velocity.abs() < 5.0
+                && sim.wheels[WHEEL_RR].angular_velocity.abs() < 5.0,
+            "rear omegas {:?} slip {:?} load {:?}",
+            sim.wheels.map(|w| w.angular_velocity),
+            sim.wheels.map(|w| w.slip_ratio),
+            sim.wheels.map(|w| w.load)
+        );
         assert!(sim.wheels[WHEEL_FL].angular_velocity > 20.0);
     }
 
@@ -860,6 +1016,205 @@ mod tests {
             top_gear = top_gear.max(sim.gear);
         }
         assert!(top_gear >= 3, "only reached gear {top_gear}");
+    }
+
+    #[test]
+    fn tire_curve_peaks_then_falls_to_sliding_grip() {
+        assert!((tire_curve(1.0) - 1.0).abs() < 0.01, "peak {}", tire_curve(1.0));
+        assert!(tire_curve(0.5) < tire_curve(0.9));
+        let sliding = tire_curve(6.0);
+        assert!(sliding < 0.95 && sliding > 0.8, "sliding grip {sliding}");
+    }
+
+    #[test]
+    fn lsd_moves_torque_to_the_slower_wheel() {
+        let [l, r] = lsd_split(1000.0, 60.0, 20.0);
+        assert!((l + r - 1000.0).abs() < 1e-3, "torque conserved");
+        assert!(l < 500.0 && r > 500.0, "left {l} right {r}");
+        let [l, r] = lsd_split(1000.0, 30.0, 30.0);
+        assert!((l - r).abs() < 1e-3);
+    }
+
+    /// Forward force the sim produces at a steady 12 m/s on full throttle.
+    fn thrust_in_gear(gear: i8) -> f32 {
+        let mut sim = make_sim();
+        let mut body = rest_body();
+        body.velocity = vec3(0.0, 0.0, -12.0);
+        sim.gear = gear;
+        sim.gear_hold = true; // isolates the torque path from auto-shifting
+        let input = DriverInput {
+            throttle: 1.0,
+            ..Default::default()
+        };
+        let mut thrust = 0.0;
+        for _ in 0..90 {
+            let (f, _) = sim.step(&body, &input, &FlatGround, FIXED_DT);
+            thrust = f.force.dot(Vec3::NEG_Z);
+        }
+        thrust
+    }
+
+    #[test]
+    fn lower_gears_multiply_torque() {
+        let g2 = thrust_in_gear(2);
+        let g5 = thrust_in_gear(5);
+        assert!(g2 > g5 * 1.3, "gear 2 thrust {g2} vs gear 5 {g5}");
+    }
+
+    #[test]
+    fn engine_braking_slows_a_coasting_car() {
+        let mut sim = make_sim();
+        let mut body = rest_body();
+        body.velocity = vec3(0.0, 0.0, -25.0);
+        sim.gear = 3;
+        sim.gear_hold = true;
+        let mut decel = 0.0;
+        for _ in 0..90 {
+            let (f, _) = sim.step(&body, &DriverInput::default(), &FlatGround, FIXED_DT);
+            decel = -f.force.dot(Vec3::NEG_Z);
+        }
+        // Aero + rolling alone at 25 m/s is well under this.
+        assert!(decel > 450.0, "coasting drag {decel}");
+    }
+
+    #[test]
+    fn steering_assist_countersteers_a_slide() {
+        // Sliding right (+x) while pointing forward: the neutral steer angle
+        // is toward the slide, so hands-off input should countersteer.
+        let run = |assist: f32| {
+            let mut tuning = LiveTuning::default();
+            tuning.assist = assist;
+            let mut sim = VehicleSim::new(VehicleConfig::new(CarPreset::balanced(), tuning));
+            let mut body = rest_body();
+            body.velocity = vec3(8.0, 0.0, -15.0);
+            for _ in 0..30 {
+                sim.step(&body, &DriverInput::default(), &FlatGround, FIXED_DT);
+            }
+            sim.steer_angle()
+        };
+        assert!(run(0.0).abs() < 1e-4, "no assist, no steer");
+        assert!(run(1.0) < -0.1, "assist steer {}", run(1.0));
+    }
+
+    struct Slippery;
+    impl GroundQuery for Slippery {
+        fn cast_ray(&self, o: Vec3, d: Vec3, m: f32) -> Option<RayHit> {
+            FlatGround.cast_ray(o, d, m)
+        }
+        fn surface_at(&self, _p: Vec3) -> Surface {
+            Surface { grip: 0.5, rolling: 3.0 }
+        }
+    }
+
+    #[test]
+    fn low_grip_surface_cuts_tire_force() {
+        let side_force = |ground: &dyn GroundQuery| {
+            let mut sim = make_sim();
+            let mut body = rest_body();
+            body.velocity = vec3(4.0, 0.0, -15.0);
+            let mut total = 0.0;
+            for _ in 0..30 {
+                sim.step(&body, &DriverInput::default(), ground, FIXED_DT);
+                total = sim.wheels.iter().map(|w| w.lateral_force).sum::<f32>();
+            }
+            total
+        };
+        let asphalt = side_force(&FlatGround);
+        let grass = side_force(&Slippery);
+        assert!(grass < asphalt * 0.7, "grass {grass} vs asphalt {asphalt}");
+    }
+
+    /// Planar rigid-body harness (yaw only, ride height pinned) so handling
+    /// scenarios can run without the physics engine. Returns the drift angle
+    /// (deg) and speed (km/h) sampled every 0.25 s.
+    fn drive(
+        mut sim: VehicleSim,
+        seconds: f32,
+        start_speed: f32,
+        start_yaw: f32,
+        input_at: impl Fn(f32) -> DriverInput,
+    ) -> Vec<(f32, f32, i8, f32, f32)> {
+        let p = CarPreset::balanced();
+        let inertia = p.mass_kg * (4.6f32 * 4.6 + 2.0 * 2.0) / 12.0;
+        let mut body = rest_body();
+        let mut yaw = start_yaw;
+        body.velocity = vec3(0.0, 0.0, -start_speed);
+        let mut out = vec![];
+        let steps = (seconds / FIXED_DT) as usize;
+        for i in 0..steps {
+            let t = i as f32 * FIXED_DT;
+            body.rotation = Quat::from_rotation_y(yaw);
+            let (f, tel) = sim.step(&body, &input_at(t), &FlatGround, FIXED_DT);
+            body.velocity += Vec3::new(f.force.x, 0.0, f.force.z) / body.mass * FIXED_DT;
+            body.angular_velocity.y += f.torque.y / inertia * FIXED_DT;
+            yaw += body.angular_velocity.y * FIXED_DT;
+            if i % (FIXED_DT.recip() as usize / 4) == 0 {
+                out.push((tel.drift_angle.to_degrees(), tel.speed * 3.6, sim.gear(), sim.rpm(), sim.steer_angle().to_degrees()));
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn steering_step_settles_back_to_straight() {
+        let r = drive(make_sim(), 5.0, 15.0, 0.0, |t| DriverInput {
+            throttle: 0.3,
+            steer: if (0.5..1.5).contains(&t) { 0.6 } else { 0.0 },
+            ..Default::default()
+        });
+        let peak = r.iter().map(|s| s.0.abs()).fold(0.0, f32::max);
+        assert!(peak < 15.0, "peak slip {peak}");
+        assert!(r.last().unwrap().0.abs() < 1.0, "ended at {}", r.last().unwrap().0);
+    }
+
+    #[test]
+    fn a_handbrake_slide_is_catchable_by_lifting() {
+        // Kick the rear out at 61 km/h, then lift: the assisted car swings
+        // out to a drift angle and comes back instead of spinning.
+        let r = drive(make_sim(), 7.0, 17.0, 0.0, |t| DriverInput {
+            throttle: if t < 0.3 { 0.3 } else { 0.2 },
+            steer: if (0.3..0.9).contains(&t) { 0.6 } else { 0.0 },
+            handbrake: (0.3..0.7).contains(&t),
+            ..Default::default()
+        });
+        let peak = r.iter().map(|s| s.0.abs()).fold(0.0, f32::max);
+        assert!(peak > 15.0, "no real slide: peak {peak}");
+        assert!(peak < 60.0, "spun out: peak {peak}");
+        assert!(r.last().unwrap().0.abs() < 5.0, "ended at {}", r.last().unwrap().0);
+    }
+
+    #[test]
+    fn explore_demo_entry() {
+        for (spd, st, thr) in [(8.0, 1.0, 1.0), (8.0, 0.6, 1.0), (12.0, 1.0, 1.0), (12.0, 0.6, 0.8), (12.0, 1.0, 0.6)] {
+            let r = drive(make_sim(), 6.0, spd, 0.0, |_t| DriverInput {
+                throttle: thr,
+                steer: st,
+                ..Default::default()
+            });
+            eprintln!("spd {spd} steer {st} thr {thr}: {:?}", r.iter().map(|s| (s.0.round() as i32, s.1.round() as i32, s.2)).collect::<Vec<_>>());
+        }
+    }
+
+    #[test]
+    fn assist_zero_is_pure_simulation() {
+        // With no assist the same kick must not be corrected for the driver.
+        let mut tuning = LiveTuning::default();
+        tuning.assist = 0.0;
+        let sim = VehicleSim::new(VehicleConfig::new(CarPreset::balanced(), tuning));
+        let r = drive(sim, 4.0, 17.0, 0.0, |t| DriverInput {
+            throttle: 0.2,
+            handbrake: (0.3..0.7).contains(&t),
+            steer: if (0.3..0.9).contains(&t) { 0.6 } else { 0.0 },
+            ..Default::default()
+        });
+        let assisted = drive(make_sim(), 4.0, 17.0, 0.0, |t| DriverInput {
+            throttle: 0.2,
+            handbrake: (0.3..0.7).contains(&t),
+            steer: if (0.3..0.9).contains(&t) { 0.6 } else { 0.0 },
+            ..Default::default()
+        });
+        let end = |v: &Vec<(f32, f32, i8, f32, f32)>| v.last().unwrap().0.abs();
+        assert!(end(&r) > end(&assisted) + 10.0, "no assist {} vs assist {}", end(&r), end(&assisted));
     }
 
     #[test]

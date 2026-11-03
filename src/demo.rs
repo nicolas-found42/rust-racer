@@ -74,7 +74,7 @@ impl Plugin for DemoPlugin {
         }
         app.init_resource::<DemoState>()
             .add_systems(Startup, demo_setup)
-            .add_systems(Update, (demo_enter_drive, demo_telemetry, demo_auto_reset, demo_camera_cycle, demo_clearance_probe, demo_wheel_dir));
+            .add_systems(Update, (demo_enter_drive, demo_telemetry, demo_auto_reset, demo_camera_cycle, demo_clearance_probe, demo_wheel_dir, demo_entry_probe));
         info!("demo harness enabled (RACER_DEMO=1)");
     }
 }
@@ -194,28 +194,28 @@ pub fn scripted_input(elapsed: f64) -> DriverInput {
     let t = elapsed as f32 % 14.0;
     let mut input = DriverInput::default();
     // Launch straight.
-    if (0.5..3.0).contains(&t) {
+    if (0.5..2.5).contains(&t) {
         input.throttle = 1.0;
     }
-    // Ease into a right-hand slide: part throttle, moderate steer, short
-    // handbrake kiss to unsettle the rear.
-    if (3.0..3.35).contains(&t) {
-        input.throttle = 0.8;
-        input.steer = 0.5;
+    // Handbrake entry into a left-hand slide, then hold it on part throttle
+    // (the steering assist countersteers).
+    if (2.5..2.9).contains(&t) {
+        input.throttle = 0.6;
+        input.steer = 1.0;
         input.handbrake = true;
     }
-    if (3.35..6.0).contains(&t) {
-        input.throttle = 0.9;
-        input.steer = 0.5;
+    if (2.9..6.5).contains(&t) {
+        input.throttle = 0.65;
+        input.steer = 1.0;
     }
     // Swing the other way.
-    if (6.0..9.0).contains(&t) {
-        input.throttle = 0.9;
-        input.steer = -0.5;
+    if (6.5..10.5).contains(&t) {
+        input.throttle = 0.7;
+        input.steer = -1.0;
     }
     // Circle back toward the pad center.
-    if (9.0..12.5).contains(&t) {
-        input.throttle = 0.85;
+    if (10.5..12.5).contains(&t) {
+        input.throttle = 0.5;
         input.steer = 0.6;
     }
     // Settle before the next cycle.
@@ -356,5 +356,36 @@ fn demo_wheel_dir(
         runtime.wheels.map(|w| (w.angular_velocity * 10.0).round() / 10.0),
         runtime.steer_visual,
         runtime.yaw_rate
+    );
+}
+
+/// Log wheel and input state through the scripted drift entry (3.0 s into each
+/// 14 s cycle), for comparing the game against the planar test harness.
+fn demo_entry_probe(
+    mut next: Local<f64>,
+    time: Res<Time>,
+    runtime: Res<VehicleRuntime>,
+    input: Res<crate::input::DriverInputRes>,
+) {
+    let now = time.elapsed_secs_f64();
+    let t = now % 14.0;
+    if !(2.9..4.6).contains(&t) || now < *next {
+        return;
+    }
+    *next = now + 0.1;
+    let w = &runtime.wheels;
+    info!(
+        "entry t={:.1} in(thr={:.2} st={:.2} hb={}) spd={:.1} yaw={:.2} steer={:.0} omega={:?} kappa={:?} load={:?} grounded={:?}",
+        t,
+        input.input.throttle,
+        input.input.steer,
+        input.input.handbrake,
+        runtime.telemetry.speed,
+        runtime.yaw_rate,
+        runtime.steer_visual.to_degrees(),
+        w.map(|x| x.angular_velocity.round()),
+        w.map(|x| (x.slip_ratio * 100.0).round() / 100.0),
+        w.map(|x| x.load.round()),
+        w.map(|x| x.grounded)
     );
 }
